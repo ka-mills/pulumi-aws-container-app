@@ -1,0 +1,260 @@
+name: ecs-web-app
+runtime: yaml
+
+#################################
+###### ----- Config ----- ####### 
+#################################
+
+config:
+  aws:region: us-east-1
+  custom_message: My Custom Message
+
+#################################
+##### ----- Variables ----- ##### 
+#################################
+
+variables:
+# Retrieving custom value for webpage from config
+  customMessage: ${custom_message}
+
+# Retrieving default VPC and subnets
+  vpcId:
+    fn::invoke:
+      function: aws:ec2:getVpc
+      arguments:
+        default: true
+      return: id
+
+  subnetIds:
+    fn::invoke:
+      function: aws:ec2:getSubnets
+      arguments:
+        filters:
+          - name: vpc-id
+            values:
+              - ${vpcId}
+      return: ids
+
+# ECS container definition
+  containerDefinitions: |
+        [
+          {
+            "name": "simple-web-app",
+            "image": "${AppRepo.repositoryUrl}:latest",
+            "essential": true,
+            "portMappings": [
+              {
+                "containerPort": 8080,
+                "hostPort": 8080
+              }
+            ],
+            "environment": [
+          {
+            "name": "CUSTOM_MESSAGE",
+            "value": "${customMessage}"
+          }
+        ]
+          }
+        ]
+
+# Function to retrieve ECR credentials
+  EcrCredentials:
+    fn::invoke:
+      function: aws:ecr:getAuthorizationToken
+
+#################################
+##### ----- Resources ----- ##### 
+#################################
+
+resources:
+# Build Docker image and push to ECR
+  CustomDockerImage:
+    type: docker:Image
+    properties:
+      build:
+        context: ./web-app
+        dockerfile: web-app/Dockerfile
+        platform: linux/amd64
+      imageName: ${AppRepo.repositoryUrl}:latest
+      registry:
+        server: ${AppRepo.repositoryUrl}   
+        username: ${EcrCredentials.userName}
+        password: ${EcrCredentials.password}
+
+  AppRepo:
+    type: aws:ecr:Repository
+    properties:
+      name: simple-web-app
+      forceDelete: true
+
+# ECS resources
+  AppCluster:
+    type: aws:ecs:Cluster
+    properties:
+      name: app-cluster
+
+  AppService:
+    type: aws:ecs:Service
+    properties:
+      cluster: ${AppCluster.id}
+      desiredCount: 1
+      launchType: FARGATE
+      taskDefinition: ${AppTaskDefinition.arn}
+      networkConfiguration:
+        subnets: ${subnetIds}
+        assignPublicIp: true  #ideally set to 'false' and deploy in private subnets - use NAT GW or VPC Endpoints to pull image from ECR
+        securityGroups:
+          - ${TaskSecurityGroup.id}
+      loadBalancers:
+        - containerName: "simple-web-app"
+          containerPort: 8080
+          targetGroupArn: ${AlbTargetGroup.arn}
+
+  TaskSecurityGroup:
+    type: aws:ec2:SecurityGroup
+    properties:
+      name: task-web-app
+      vpcId: ${vpcId}
+      description: Security group for ECS web app
+  TaskIngressRule:
+    type: aws:vpc:SecurityGroupIngressRule
+    name: allow_inbound_alb_traffic
+    properties:
+      securityGroupId: ${TaskSecurityGroup.id}
+      referencedSecurityGroupId: ${AlbSecurityGroup.id}
+      fromPort: 8080
+      ipProtocol: tcp
+      toPort: 8080
+  TaskEgressRule:
+    type: aws:vpc:SecurityGroupEgressRule
+    name: allow_egress_https_traffic
+    properties:
+      securityGroupId: ${TaskSecurityGroup.id}
+      cidrIpv4: 0.0.0.0/0
+      fromPort: 443
+      ipProtocol: tcp
+      toPort: 443
+
+  AppTaskDefinition:
+    type: aws:ecs:TaskDefinition
+    properties:
+      family: app-task-family
+      requiresCompatibilities: ["FARGATE"]
+      cpu: "256"
+      memory: "512"
+      networkMode: "awsvpc"
+      executionRoleArn: ${TaskExecutionRole.arn}
+      taskRoleArn:  ${TaskRole.arn}
+      containerDefinitions: ${containerDefinitions}
+
+  TaskExecutionRole:
+    type: aws:iam:Role
+    properties:
+      name: ecs-web-app-execution-role
+      path: /system/
+      managedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      assumeRolePolicy: |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        }
+
+  TaskRole:
+    type: aws:iam:Role
+    properties:
+      name: ecs-web-app-task-role
+      path: /system/
+      assumeRolePolicy: |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        }
+
+# ALB resources
+  AppLoadBalancer:
+    type: aws:alb:LoadBalancer
+    properties:
+      name: "ecs-web-app-alb"
+      loadBalancerType: application
+      securityGroups:
+        - ${AlbSecurityGroup.id}
+      subnets: ${subnetIds}
+
+  AlbTargetGroup:
+    type: aws:lb:TargetGroup
+    properties:
+      name: "ecs-web-app-tg"
+      port: 8080
+      protocol: HTTP
+      targetType: ip
+      vpcId: ${vpcId}
+      healthCheck:
+        path: "/"
+        port: "8080"
+        protocol: HTTP
+        healthyThreshold: 2
+        unhealthyThreshold: 10
+        timeout: 5
+        interval: 60
+
+  AlbListener:
+    type: aws:alb:Listener
+    properties:
+      loadBalancerArn: ${AppLoadBalancer.arn}
+      port: 80
+      protocol: HTTP
+      defaultActions:
+        - type: "forward"
+          targetGroupArn: ${AlbTargetGroup.arn}
+
+  AlbSecurityGroup:
+    type: aws:ec2:SecurityGroup
+    properties:
+      name: ecs-alb
+      vpcId: ${vpcId}
+      description: Security group for ECS ALB
+  ALBIngressRule:
+    type: aws:vpc:SecurityGroupIngressRule
+    name: allow_inbound_web_traffic
+    properties:
+      securityGroupId: ${AlbSecurityGroup.id}
+      cidrIpv4: 0.0.0.0/0
+      fromPort: 80
+      ipProtocol: tcp
+      toPort: 80
+  ALBEgressRule:
+    type: aws:vpc:SecurityGroupEgressRule
+    name: allow_egress_app-traffic
+    properties:
+      securityGroupId: ${AlbSecurityGroup.id}
+      cidrIpv4: 0.0.0.0/0
+      fromPort: 0
+      ipProtocol: tcp
+      toPort: 65535
+
+#################################
+##### ----- Outputs ----- ##### 
+#################################
+
+outputs:
+  clusterName: ${AppCluster.name}
+  repositoryUrl: ${AppRepo.repositoryUrl}
+  serviceName: ${AppService.name}
+  albUrl: ${AppLoadBalancer.dnsName}
